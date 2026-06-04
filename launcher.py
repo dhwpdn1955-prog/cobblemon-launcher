@@ -89,12 +89,17 @@ def sync_overrides(mrpack_path, log_cb):
             if not rel or e.endswith("/"): continue
             folder = Path(rel).parts[0]
             remote_by.setdefault(folder,set()).add(Path(rel).name)
+        meta = load_meta()
+        launcher_managed_files = set(meta.get("managed_overrides", []))
         for folder, managed in MANAGED_DIRS.items():
             if not managed: continue
             ld = INSTANCE_DIR/folder
             if not ld.exists(): continue
+            remote_files = remote_by.get(folder, set())
             for lf in ld.iterdir():
-                if lf.is_file() and lf.name not in remote_by.get(folder,set()):
+                key = f"{folder}/{lf.name}"
+                # 런처가 설치한 파일이고 이번 mrpack에 없는 경우만 삭제
+                if lf.is_file() and key in launcher_managed_files and lf.name not in remote_files:
                     lf.unlink(); log_cb(f"[삭제] {folder}/{lf.name}")
         changed = []
         for e in entries:
@@ -108,17 +113,29 @@ def sync_overrides(mrpack_path, log_cb):
             dest.write_bytes(data); changed.append(rel)
         if changed: log_cb(f"설정/리소스: {len(changed)}개 업데이트")
         else: log_cb("설정/리소스: 모두 최신 상태")
+        # managed 목록 갱신
+        meta = load_meta()
+        all_remote_keys = set()
+        for e in entries:
+            rel = e[len("overrides/"):]
+            if not rel or e.endswith("/"): continue
+            parts = Path(rel).parts
+            if parts: all_remote_keys.add(f"{parts[0]}/{Path(rel).name}")
+        meta["managed_overrides"] = list(all_remote_keys)
+        save_meta(meta)
 
 def find_modrinth():
     localappdata = os.environ.get("LOCALAPPDATA","")
     appdata = os.environ.get("APPDATA","")
     candidates = [
-        Path(localappdata)/"ModrinthApp"/"ModrinthApp.exe",
-        Path(localappdata)/"Programs"/"ModrinthApp"/"ModrinthApp.exe",
-        Path(localappdata)/"modrinth-app"/"ModrinthApp.exe",
-        Path(localappdata)/"Modrinth"/"ModrinthApp.exe",
-        Path("C:/Program Files/ModrinthApp/ModrinthApp.exe"),
-        Path("C:/Program Files (x86)/ModrinthApp/ModrinthApp.exe"),
+        Path(localappdata)/"Modrinth App"/"Modrinth App.exe",
+        Path(localappdata)/"Modrinth App"/"Modrinth App.exe",
+        Path(localappdata)/"Programs"/"ModrinthApp"/"Modrinth App.exe",
+        Path(localappdata)/"modrinth-app"/"Modrinth App.exe",
+        Path(localappdata)/"Modrinth"/"Modrinth App.exe",
+        Path("C:/Program Files/Modrinth App/Modrinth App.exe"),
+        Path("C:/Program Files/ModrinthApp/Modrinth App.exe"),
+        Path("C:/Program Files (x86)/ModrinthApp/Modrinth App.exe"),
     ]
     # 못 찾으면 레지스트리 시도
     for p in candidates:
