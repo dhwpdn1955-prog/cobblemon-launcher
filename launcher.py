@@ -1,4 +1,4 @@
-import os, sys, json, hashlib, zipfile, subprocess, threading, urllib.request
+import os, sys, json, hashlib, zipfile, shutil, subprocess, threading, urllib.request
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
@@ -10,9 +10,20 @@ INSTANCE_NAME = "Cobbleverse"
 VERSION_URL = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main/version.json"
 PRISM_BASE   = Path(os.environ.get("APPDATA", "")) / "PrismLauncher" / "instances"
 INSTANCE_DIR = PRISM_BASE / INSTANCE_NAME / ".minecraft"
-MODS_DIR     = INSTANCE_DIR / "mods"
+MODS_DIR          = INSTANCE_DIR / "mods"
+RESOURCEPACKS_DIR = INSTANCE_DIR / "resourcepacks"
+DATAPACKS_DIR     = INSTANCE_DIR / "datapacks"
 META_FILE    = INSTANCE_DIR / "launcher_meta.json"
-LAUNCHER_VERSION = "1.0.0"
+LAUNCHER_VERSION = "1.1.0"
+
+# overrides 하위 폴더별 동기화 전략
+# True = 런처가 완전 관리 (없는 파일 삭제), False = 덮어쓰기만
+MANAGED_DIRS = {
+    "mods":         True,
+    "resourcepacks": True,
+    "datapacks":    True,
+    "config":       False,  # config는 삭제 없이 덮어쓰기만
+}
 
 def sha1_of_file(path):
     h = hashlib.sha1()
@@ -22,12 +33,12 @@ def sha1_of_file(path):
     return h.hexdigest()
 
 def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "CobbleverseLauncher/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "CobblemonLauncher/1.1"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 def download_file(url, dest, progress_cb=None):
-    req = urllib.request.Request(url, headers={"User-Agent": "CobbleverseLauncher/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "CobblemonLauncher/1.1"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         total = int(resp.headers.get("Content-Length", 0))
         downloaded = 0
@@ -59,6 +70,7 @@ def parse_mrpack(mrpack_path):
             return json.load(f)
 
 def sync_mods(mrpack_path, log_cb, progress_cb):
+    """modrinth.index.json 기반 모드 동기화 (해시 비교)"""
     index = parse_mrpack(mrpack_path)
     remote_mods = {
         Path(e["path"]).name: e
@@ -80,34 +92,75 @@ def sync_mods(mrpack_path, log_cb, progress_cb):
         to_download.append((name, info))
 
     if not to_download:
-        log_cb("  모든 모드가 최신 상태입니다.")
+        log_cb("  모드: 모두 최신 상태")
         progress_cb(1.0)
         return
 
-    log_cb(f"  {len(to_download)}개 파일 업데이트 필요")
+    log_cb(f"  모드: {len(to_download)}개 업데이트")
     for i, (name, info) in enumerate(to_download):
         log_cb(f"  [{i+1}/{len(to_download)}] {name}")
         download_file(info["downloads"][0], MODS_DIR / name)
         progress_cb((i + 1) / len(to_download))
-    log_cb(f"  완료: {len(to_download)}개 업데이트됨")
 
-def copy_overrides(mrpack_path, log_cb):
+def sync_overrides(mrpack_path, log_cb):
+    """
+    overrides 폴더 동기화
+    - mods/resourcepacks/datapacks: 완전 관리 (원격에 없는 파일 삭제)
+    - config 등 나머지: 덮어쓰기만
+    """
     with zipfile.ZipFile(mrpack_path, "r") as zf:
-        overrides = [n for n in zf.namelist() if n.startswith("overrides/")]
-        if not overrides:
+        all_entries = [n for n in zf.namelist() if n.startswith("overrides/")]
+        if not all_entries:
             return
-        log_cb("  config 파일 복사 중...")
-        for name in overrides:
-            rel = name[len("overrides/"):]
-            if not rel:
+
+        # 원격 파일 목록을 폴더별로 수집
+        remote_by_folder = {}
+        for entry in all_entries:
+            rel = entry[len("overrides/"):]
+            if not rel or entry.endswith("/"):
+                continue
+            parts = Path(rel).parts
+            if not parts:
+                continue
+            folder = parts[0]
+            remote_by_folder.setdefault(folder, set()).add(Path(rel).name)
+
+        # 완전 관리 폴더: 원격에 없는 로컬 파일 삭제
+        for folder, managed in MANAGED_DIRS.items():
+            if not managed:
+                continue
+            local_dir = INSTANCE_DIR / folder
+            if not local_dir.exists():
+                continue
+            remote_files = remote_by_folder.get(folder, set())
+            for local_file in local_dir.iterdir():
+                if local_file.is_file() and local_file.name not in remote_files:
+                    local_file.unlink()
+                    log_cb(f"  [삭제] {folder}/{local_file.name}")
+
+        # 파일 복사
+        changed = []
+        for entry in all_entries:
+            rel = entry[len("overrides/"):]
+            if not rel or entry.endswith("/"):
                 continue
             dest = INSTANCE_DIR / rel
-            if name.endswith("/"):
+            if entry.endswith("/"):
                 dest.mkdir(parents=True, exist_ok=True)
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(name) as src, open(dest, "wb") as dst:
-                    dst.write(src.read())
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(entry) as src:
+                data = src.read()
+            # 변경된 경우만 덮어쓰기
+            if dest.exists() and dest.read_bytes() == data:
+                continue
+            dest.write_bytes(data)
+            changed.append(rel)
+
+        if changed:
+            log_cb(f"  설정/리소스: {len(changed)}개 업데이트")
+        else:
+            log_cb("  설정/리소스: 모두 최신 상태")
 
 def find_prism():
     candidates = [
@@ -125,7 +178,7 @@ BG = "#0e0e0e"; CARD = "#161616"; ACCENT = "#e84040"; TEXT = "#e0e0e0"; DIM = "#
 class LauncherApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Cobbleverse REFORGED Launcher")
+        self.title("Cobblemon Self-Made Launcher")
         self.geometry("640x500")
         self.resizable(False, False)
         self.configure(bg=BG)
@@ -137,8 +190,8 @@ class LauncherApp(tk.Tk):
         tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
         tf = tk.Frame(self, bg=BG, pady=18)
         tf.pack(fill="x")
-        tk.Label(tf, text="COBBLEVERSE", font=("Courier New", 28, "bold"), bg=BG, fg=ACCENT).pack()
-        tk.Label(tf, text="R E F O R G E D", font=("Courier New", 9), bg=BG, fg=DIM).pack()
+        tk.Label(tf, text="COBBLEMON", font=("Courier New", 28, "bold"), bg=BG, fg=ACCENT).pack()
+        tk.Label(tf, text="S E L F - M A D E", font=("Courier New", 9), bg=BG, fg=DIM).pack()
 
         vf = tk.Frame(self, bg=CARD, padx=24, pady=10)
         vf.pack(fill="x", padx=28)
@@ -220,13 +273,13 @@ class LauncherApp(tk.Tk):
             remote = fetch_json(VERSION_URL)
             rv = remote["version"]
             url = remote["mrpack_url"]
-            tmp = Path(os.environ.get("TEMP", ".")) / "cobbleverse_update.mrpack"
+            tmp = Path(os.environ.get("TEMP", ".")) / "cobblemon_update.mrpack"
             self.log(f"모드팩 다운로드 중 (v{rv})...")
             download_file(url, tmp, lambda p: self.set_progress(p * 0.25))
             self.log("\n모드 동기화:")
             sync_mods(tmp, self.log, lambda p: self.set_progress(0.25 + p * 0.65))
-            self.log("\n설정 파일 적용:")
-            copy_overrides(tmp, self.log)
+            self.log("\n리소스팩/데이터팩/설정 동기화:")
+            sync_overrides(tmp, self.log)
             self.set_progress(1.0)
             save_local_meta({"version": rv})
             self.lbl_local.configure(text=f"로컬 버전:  {rv}", fg=TEXT)
